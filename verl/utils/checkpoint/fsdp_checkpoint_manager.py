@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import warnings
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from typing import Optional
 
@@ -190,6 +191,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
           - extra state dict (scheduler + RNG)
           - HF tokenizer/processor and model/config on rank 0
           - optional full HF model under 'huggingface/' if requested
+          - optional PEFT LoRA adapter under 'lora_adapter/' if requested
 
         Rotates old checkpoints, keeping at most `max_ckpt_to_keep`.
 
@@ -300,6 +302,40 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         # wait for everyone to dump to local
         torch.distributed.barrier()
+
+        if self.should_save_lora_adapter:
+            peft_model = getattr(self.model, "_fsdp_wrapped_module", self.model)
+            if not hasattr(peft_model, "peft_config"):
+                log_with_rank(
+                    "'lora_adapter' was requested in checkpoint.save_contents, but the model is not a PEFT model. "
+                    "Skipping LoRA adapter save.",
+                    rank=self.rank,
+                    logger=logger,
+                    level=logging.WARNING,
+                    log_only_rank_0=True,
+                )
+            else:
+                summon_ctx = (
+                    FSDP.summon_full_params(self.model, writeback=False)
+                    if fsdp_version(self.model) == 1
+                    else nullcontext()
+                )
+                with summon_ctx:
+                    if self.rank == 0:
+                        adapter_local_path = os.path.join(local_path, "lora_adapter")
+                        os.makedirs(adapter_local_path, exist_ok=True)
+                        peft_model.save_pretrained(
+                            adapter_local_path,
+                            safe_serialization=True,
+                            is_main_process=True,
+                        )
+                        log_with_rank(
+                            f"Saved LoRA adapter to {os.path.abspath(adapter_local_path)}",
+                            rank=self.rank,
+                            logger=logger,
+                            log_only_rank_0=True,
+                        )
+            torch.distributed.barrier()
 
         if self.should_save_hf_model:
             # Only rank 0 will save hf model and,

@@ -28,7 +28,7 @@ class CheckpointConfig(BaseConfig):
 
     Args:
         save_contents (list[str]): What to include in saved checkpoints.
-            Options: 'model', 'optimizer', 'extra', 'hf_model'.
+            Options: 'model', 'optimizer', 'extra', 'hf_model', 'lora_adapter'.
         load_contents (list[str]): Contents to load from checkpoint. Defaults to same as save_contents.
         async_save (bool): Whether to save checkpoints asynchronously. Only implemented for Megatron as of now.
     """
