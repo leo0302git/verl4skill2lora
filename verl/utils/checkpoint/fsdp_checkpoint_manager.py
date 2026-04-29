@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import warnings
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from typing import Optional
 
@@ -24,6 +23,7 @@ import torch
 import torch.distributed
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
+from safetensors.torch import save_file
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardedOptimStateDictConfig, ShardedStateDictConfig, StateDictType
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
@@ -31,7 +31,7 @@ from transformers.dynamic_module_utils import custom_object_save
 
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
-from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
+from verl.utils.fsdp_utils import collect_lora_params, fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
 from verl.utils.transformers_compat import get_auto_model_for_vision2seq
 
@@ -315,26 +315,24 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     log_only_rank_0=True,
                 )
             else:
-                summon_ctx = (
-                    FSDP.summon_full_params(self.model, writeback=False)
-                    if fsdp_version(self.model) == 1
-                    else nullcontext()
-                )
-                with summon_ctx:
-                    if self.rank == 0:
-                        adapter_local_path = os.path.join(local_path, "lora_adapter")
-                        os.makedirs(adapter_local_path, exist_ok=True)
-                        peft_model.save_pretrained(
-                            adapter_local_path,
-                            safe_serialization=True,
-                            is_main_process=True,
-                        )
-                        log_with_rank(
-                            f"Saved LoRA adapter to {os.path.abspath(adapter_local_path)}",
-                            rank=self.rank,
-                            logger=logger,
-                            log_only_rank_0=True,
-                        )
+                lora_state_dict = collect_lora_params(self.model, layered_summon=False, base_sync_done=True)
+                if self.rank == 0:
+                    adapter_local_path = os.path.join(local_path, "lora_adapter")
+                    os.makedirs(adapter_local_path, exist_ok=True)
+                    peft_config = peft_model.peft_config["default"]
+                    peft_config.save_pretrained(adapter_local_path)
+                    save_file(
+                        lora_state_dict,
+                        os.path.join(adapter_local_path, "adapter_model.safetensors"),
+                        metadata={"format": "pt"},
+                    )
+                    log_with_rank(
+                        f"Saved LoRA adapter to {os.path.abspath(adapter_local_path)}",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+                del lora_state_dict
             torch.distributed.barrier()
 
         if self.should_save_hf_model:
